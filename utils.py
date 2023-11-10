@@ -1,94 +1,83 @@
-from copy import deepcopy
+from typing import Iterable
 
 import torch
+import torch.utils.data
+import torchvision
 from torch import nn
 from torch.nn import functional as F
-from torch.autograd import Variable
-import torch.utils.data
 
 
-def variable(t: torch.Tensor, use_cuda=True, **kwargs):
-    if torch.cuda.is_available() and use_cuda:
-        t = t.cuda()
-    return Variable(t, **kwargs)
+class EWC:
+    def __init__(self, model: nn.Module, dataset: torch.Tensor):
+        self.means = {
+            n: p.detach().clone()
+            for n, p in model.named_parameters()
+            if p.requires_grad
+        }
+        self.precision_matrices = self.diag_fisher(model, dataset)
 
+    @staticmethod
+    def diag_fisher(model: nn.Module, dataset: torch.Tensor):
+        precision_matrices: dict[str, torch.Tensor] = {}
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            precision_matrices[name] = torch.zeros_like(parameter)
 
-class EWC(object):
-    def __init__(self, model: nn.Module, dataset: list):
+        model.eval()
 
-        self.model = model
-        self.dataset = dataset
+        output: torch.Tensor = model(dataset.cuda())
+        labels = output.max(1).indices
+        loss = F.nll_loss(F.log_softmax(output, dim=1), labels, reduction="none")
 
-        self.params = {n: p for n, p in self.model.named_parameters() if p.requires_grad}
-        self._means = {}
-        self._precision_matrices = self._diag_fisher()
+        for loss_per_image in loss:
+            model.zero_grad()
+            loss_per_image.backward(retain_graph=True)
 
-        for n, p in deepcopy(self.params).items():
-            self._means[n] = variable(p.data)
+            for name, parameter in model.named_parameters():
+                assert parameter.requires_grad
+                assert parameter.grad is not None
+                precision_matrices[name] += parameter.grad**2
 
-    def _diag_fisher(self):
-        precision_matrices = {}
-        for n, p in deepcopy(self.params).items():
-            p.data.zero_()
-            precision_matrices[n] = variable(p.data)
+        for precision_matrix in precision_matrices.values():
+            precision_matrix /= len(dataset)
 
-        self.model.eval()
-        for input in self.dataset:
-            self.model.zero_grad()
-            input = variable(input)
-            output = self.model(input).view(1, -1)
-            label = output.max(1)[1].view(-1)
-            loss = F.nll_loss(F.log_softmax(output, dim=1), label)
-            loss.backward()
-
-            for n, p in self.model.named_parameters():
-                precision_matrices[n].data += p.grad.data ** 2 / len(self.dataset)
-
-        precision_matrices = {n: p for n, p in precision_matrices.items()}
         return precision_matrices
 
     def penalty(self, model: nn.Module):
-        loss = 0
-        for n, p in model.named_parameters():
-            _loss = self._precision_matrices[n] * (p - self._means[n]) ** 2
-            loss += _loss.sum()
-        return loss
+        return sum(
+            (self.precision_matrices[name] * (parameter - self.means[name]) ** 2).sum()
+            for name, parameter in model.named_parameters()
+        )
 
 
-def normal_train(model: nn.Module, optimizer: torch.optim, data_loader: torch.utils.data.DataLoader):
+def train(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    data_loader: Iterable[tuple[torch.Tensor, torch.Tensor]],
+    ewc: EWC | None = None,
+    importance: float = 1,
+):
     model.train()
     epoch_loss = 0
     for input, target in data_loader:
-        input, target = variable(input), variable(target)
         optimizer.zero_grad()
-        output = model(input)
-        loss = F.cross_entropy(output, target)
-        epoch_loss += loss.data[0]
+        output = model(input.cuda())
+        loss = F.cross_entropy(output, target.cuda())
+        if ewc is not None:
+            loss += importance * ewc.penalty(model)
+        epoch_loss += loss.item()
         loss.backward()
         optimizer.step()
-    return epoch_loss / len(data_loader)
+    return epoch_loss / len(data_loader)  # type: ignore
 
 
-def ewc_train(model: nn.Module, optimizer: torch.optim, data_loader: torch.utils.data.DataLoader,
-              ewc: EWC, importance: float):
-    model.train()
-    epoch_loss = 0
-    for input, target in data_loader:
-        input, target = variable(input), variable(target)
-        optimizer.zero_grad()
-        output = model(input)
-        loss = F.cross_entropy(output, target) + importance * ewc.penalty(model)
-        epoch_loss += loss.data[0]
-        loss.backward()
-        optimizer.step()
-    return epoch_loss / len(data_loader)
-
-
-def test(model: nn.Module, data_loader: torch.utils.data.DataLoader):
+def test(model: nn.Module, dataset: torchvision.datasets.MNIST):
     model.eval()
-    correct = 0
-    for input, target in data_loader:
-        input, target = variable(input), variable(target)
-        output = model(input)
-        correct += (F.softmax(output, dim=1).max(dim=1)[1] == target).data.sum()
-    return correct / len(data_loader.dataset)
+
+    with torch.no_grad():
+        predctions: torch.Tensor = model(dataset.data.cuda()).max(dim=1).indices
+        return (
+            (predctions == dataset.targets.cuda()).count_nonzero()
+            / len(dataset.targets)
+        ).item()
