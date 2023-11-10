@@ -5,6 +5,20 @@ import torch.utils.data
 import torchvision
 from torch import nn
 from torch.nn import functional as F
+from torchvision import datasets
+
+
+class PermutedMNIST(datasets.MNIST):
+    def __init__(self, train: bool, permute_idx: torch.Tensor):
+        super().__init__("~/.torch/data/mnist", train, download=True)
+        assert len(permute_idx) == 28 * 28
+        self.data = (self.data / 255).view(len(self.data), -1)[:, permute_idx]
+
+    def __getitem__(self, index: int):
+        return self.data[index], self.targets[index]
+
+    def get_sample(self, sample_size: int):
+        return self.data[torch.randperm(len(self.data))[:sample_size]]
 
 
 class EWC:
@@ -59,25 +73,22 @@ def train(
     importance: float = 1,
 ):
     model.train()
-    epoch_loss = 0
     for input, target in data_loader:
         optimizer.zero_grad()
         output = model(input.cuda())
         loss = F.cross_entropy(output, target.cuda())
         if ewc is not None:
             loss += importance * ewc.penalty(model)
-        epoch_loss += loss.item()
         loss.backward()
         optimizer.step()
-    return epoch_loss / len(data_loader)  # type: ignore
 
 
-def test(model: nn.Module, dataset: torchvision.datasets.MNIST):
+def test(model: nn.Module, dataset: torchvision.datasets.MNIST) -> tuple[float, float]:
     model.eval()
-
     with torch.no_grad():
-        predctions: torch.Tensor = model(dataset.data.cuda()).max(dim=1).indices
-        return (
-            (predctions == dataset.targets.cuda()).count_nonzero()
-            / len(dataset.targets)
-        ).item()
+        output: torch.Tensor = model(dataset.data.cuda())
+        labels = dataset.targets.cuda()
+        loss = F.cross_entropy(output, labels).item()
+        predctions = output.max(dim=1).indices
+        acc = ((predctions == labels).count_nonzero() / len(labels)).item()
+    return loss, acc
